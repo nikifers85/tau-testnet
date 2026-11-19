@@ -576,6 +576,16 @@ def _payouts_state(lm) -> dict:
     return book.snapshot() if book is not None else {"changes": 0, "rules": []}
 
 
+def _record_tx_outcomes(block, next_snapshot) -> None:
+    """Best-effort node-local record of what each transaction did (bounty 02)."""
+    try:
+        meta = getattr(next_snapshot, "metadata", None) or {}
+        db.record_tx_outcomes(block.block_hash, block.header.block_number,
+                              meta.get("tx_outcomes") or [], meta.get("release_effects") or [])
+    except Exception:
+        logger.exception("could not record transaction outcomes")
+
+
 def _record_retractable_events(block, next_snapshot) -> None:
     """Best-effort history write; the apply verdict is already final.
 
@@ -1118,6 +1128,7 @@ def _process_new_block_locked(block: Block) -> bool:
                 _swap_in_memory_state(next_snapshot, block)
 
             _record_retractable_events(block, next_snapshot)
+            _record_tx_outcomes(block, next_snapshot)
 
             # Governance activation just changed the active consensus rule: rebuild
             # the live interpreter to that single revision (matching a restart)
@@ -1399,6 +1410,7 @@ def _rebuild_state_from_blockchain_internal(start_block=0, path_hashes=None):
                                       reason="state_hash invariant mismatch")
 
             _record_retractable_events(block, next_snapshot)
+            _record_tx_outcomes(block, next_snapshot)
 
             if _enabled:
                 # The block's evaluator history becomes durable exactly as a live

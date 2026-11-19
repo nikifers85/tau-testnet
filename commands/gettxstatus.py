@@ -125,6 +125,17 @@ def execute(raw_command: str, container):
                     "confirmations": max(1, confirmations),
                 }
                 data.update(_retractable_fields(db, tx_hash, loc["block_hash"]))
+                # Bounty 02 (#42): what the node decided for this transaction and
+                # which rules it changed. `status` keeps its meaning; a block the
+                # node applied before outcomes were recorded answers not_recorded.
+                try:
+                    recorded = db.get_tx_outcome(loc["block_hash"], tx_hash)
+                except Exception:
+                    recorded = None
+                data["outcome"] = (recorded or {}).get("outcome", "not_recorded")
+                if recorded:
+                    data.update({k: recorded[k] for k in
+                                 ("tx_index", "reason", "fee_charged", "rule_effects", "logs")})
                 return api_response.success_response("gettxstatus", data)
 
         # 3. Dropped without being mined?

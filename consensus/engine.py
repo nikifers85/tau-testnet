@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
@@ -346,7 +347,28 @@ def _clause_domain_rejection(body: str, *, guard: bool = False) -> Optional[Tupl
     return error, "rule_not_applied"
 
 
-def _release_rule_changes(lm, height, timestamp, timeout) -> List[Tuple[str, str]]:
+def _rule_effect(account, stream, before, after, kind="clause") -> Optional[Dict[str, Any]]:
+    """One rule effect for the outcome record (bounty 02, #42), or None if nothing changed.
+
+    `before`/`after` are the clause bodies (None when absent). The hash is of the
+    stored body, so a wallet can compare it with the rule it sent.
+    """
+    if before == after:
+        return None
+    if after is None:
+        action, body = "revoked", before
+    else:
+        action, body = ("registered" if before is None else "replaced"), after
+    return {
+        "account": account,
+        "kind": "guard" if stream == tau_defs.RULE_CHANGE_GUARD_INDEX else kind,
+        "stream": int(stream),
+        "action": action,
+        "sha256": hashlib.sha256(str(body).encode("utf-8")).hexdigest(),
+    }
+
+
+def _release_rule_changes(lm, height, timestamp, timeout, effects=None) -> List[Tuple[str, str]]:
     """Write every READY rule-change request, lowest id first, up to the per-block cap.
 
     Runs after the transaction loop and before expiry, so a deferred request
@@ -366,6 +388,9 @@ def _release_rule_changes(lm, height, timestamp, timeout) -> List[Tuple[str, str
         if entry is None or entry.status != STATUS_OPEN:
             continue
         processed += 1
+        keys = [(entry.sender_pubkey, tau_defs.USER_POLICY_STREAM_INDEX),
+                (entry.sender_pubkey, tau_defs.RULE_CHANGE_GUARD_INDEX)]
+        before = {k: lm.rule_offers.clause_for(*k) for k in keys}
         problem = _write_rule_change(lm, rid, entry, int(height), timeout)
         if problem:
             approvals.resolve_rule_change(rid, STATUS_FAILED)
@@ -374,6 +399,11 @@ def _release_rule_changes(lm, height, timestamp, timeout) -> List[Tuple[str, str
             continue
         approvals.resolve_rule_change(rid, STATUS_EXECUTED)
         events.append((rid.hex(), "executed"))
+        if effects is not None:
+            for k in keys:
+                eff = _rule_effect(k[0], k[1], before[k], lm.rule_offers.clause_for(*k))
+                if eff:
+                    effects.append(dict(eff, request_id=rid.hex()))
     return events
 
 
@@ -990,12 +1020,14 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         payout_book = getattr(lm, "payout_rules", None)
         if isinstance(payout_book, PayoutBook):
             payout_book.expire_due(int(block.header.timestamp))
+        release_effects: List[Dict[str, Any]] = []
         _release_rule_changes(
             lm, block.header.block_number, block.header.timestamp,
             getattr(
                 session if session is not None else getattr(proposal, "session", None),
                 "request_budget", None,
             ),
+            effects=release_effects,
         )
 
         minted = faucet.granted(
@@ -1067,6 +1099,27 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
             if event and id(tx) in accepted_obj:
                 standing_events.append(event)
         standing_events.extend((sid, "ended") for sid in ended_standing)
+
+        # Outcome of every transaction in the block (bounty 02, #42): what the
+        # node decided and which rules it changed, kept node-locally like the
+        # retractable events and served by gettxstatus. Logs are bounded and
+        # never part of any committed value.
+        from block import compute_tx_hash
+        by_id = {o.tx_id: o.status for o in outcomes}
+        tx_outcomes = []
+        for i, tx in enumerate(block.transactions):
+            receipt = exec_result.receipts.get(_receipt_lookup_key(tx, i)) or {}
+            status = by_id.get(_receipt_lookup_key(tx, i))
+            tx_outcomes.append({
+                "index": i,
+                "tx_hash": compute_tx_hash(tx) if isinstance(tx, dict) else None,
+                "outcome": {"applied": "applied", "skipped/no-op": "skipped",
+                            "invalid": "rejected"}.get(status, "not_recorded"),
+                "reason": receipt.get("reason"),
+                "fee_charged": int(receipt.get("fee_charged") or 0),
+                "rule_effects": list(receipt.get("rule_effects") or []),
+                "logs": [str(line)[:400] for line in (receipt.get("logs") or [])][:16],
+            })
 
         # 3. Post-State Materialization Layer
         
@@ -1225,6 +1278,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                 "retractable_events": retractable_events,
                 "grant_events": grant_events,
                 "standing_events": standing_events,
+                "tx_outcomes": tx_outcomes,
+                "release_effects": release_effects,
             }
         )
         
@@ -1884,10 +1939,14 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                     tx_receipt["logs"].append(
                         "Policy change failed %d open approval request(s)" % len(doomed))
 
+                previous = offers.accepted_clauses.get(key)
                 if revoking:
                     offers.accepted_clauses.pop(key, None)
                 else:
                     offers.accepted_clauses[key] = body
+                effect = _rule_effect(key[0], key[1], previous, None if revoking else body)
+                if effect:
+                    tx_receipt.setdefault("rule_effects", []).append(effect)
 
                 tx_receipt["logs"].append(
                     "o5 clause %s for %s"
@@ -2361,7 +2420,20 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                 f"Offer accept ignored (rule-change guard blocks: {guard_detail})"
                             )
                         else:
+                            try:
+                                from consensus.rule_offers import normalize_offer_rule_text as _norm
+                                _target = _norm(decision.rule_text or "")[1] if decision.accept else None
+                            except Exception:
+                                _target = None
+                            _prev_clause = (offers.clause_for(decision.actor_pubkey, _target)
+                                            if _target is not None else None)
                             target_stream = offers.submit_decision(decision)
+                            if target_stream is not None:
+                                _key = (decision.actor_pubkey, target_stream)
+                                _eff = _rule_effect(_key[0], _key[1], _prev_clause,
+                                                    offers.clause_for(*_key))
+                                if _eff:
+                                    tx_receipt.setdefault("rule_effects", []).append(_eff)
                             if target_stream is None:
                                 tx_receipt["logs"].append(
                                     "Offer resolved: " + decision.offer_id_hex
@@ -3230,6 +3302,12 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                         current_tau_bytes += rule_op_data.encode("utf-8")
                                     _rule_touched_canonical = True
                                     tx_receipt["logs"].append("Rule applied")
+                                    tx_receipt.setdefault("rule_effects", []).append({
+                                        "account": sender, "kind": "application_unit",
+                                        "stream": None, "action": "accumulated",
+                                        "sha256": hashlib.sha256(
+                                            str(rule_op_data).encode("utf-8")).hexdigest(),
+                                    })
 
                           except tau_shrink.ShrinkTypeConflict as e:
                             # W3: node-local. This process cannot represent the

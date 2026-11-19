@@ -476,6 +476,41 @@ def init_db():
                     PRIMARY KEY (retractable_id, block_hash, outcome)
                 );
             ''')
+            # Outcome of every included transaction and the rule effects it had
+            # (bounty 02, #42). Node-local and keyed per block like
+            # retractable_events: a reorg needs no cleanup, canonicality is
+            # resolved at query time through tx_index.
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS tx_outcomes (
+                    block_hash   TEXT NOT NULL,
+                    tx_hash      TEXT NOT NULL,
+                    block_number INTEGER NOT NULL,
+                    tx_index     INTEGER NOT NULL,
+                    outcome      TEXT NOT NULL,
+                    reason       TEXT,
+                    fee_charged  INTEGER NOT NULL DEFAULT 0,
+                    effects_json TEXT NOT NULL DEFAULT '[]',
+                    logs_json    TEXT NOT NULL DEFAULT '[]',
+                    PRIMARY KEY (block_hash, tx_hash)
+                );
+            ''')
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS rule_effects (
+                    account      TEXT NOT NULL,
+                    block_hash   TEXT NOT NULL,
+                    block_number INTEGER NOT NULL,
+                    tx_hash      TEXT,
+                    request_id   TEXT,
+                    kind         TEXT NOT NULL,
+                    stream       INTEGER,
+                    action       TEXT NOT NULL,
+                    sha256       TEXT NOT NULL
+                );
+            ''')
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_rule_effects_account "
+                "ON rule_effects(account, block_number);"
+            )
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS peers (
                     peer_id      TEXT PRIMARY KEY,
@@ -2728,6 +2763,63 @@ def get_open_retractables(address: str, role: str = "all") -> List[Dict]:
         }
         for r in rows
     ]
+
+
+def record_tx_outcomes(block_hash: str, block_number: int, outcomes, release_effects=()) -> None:
+    """Persist a block's per-transaction outcomes and rule effects (node-local).
+
+    Diagnostic only, like retractable events: a failure is logged and never
+    reaches block commit. Re-recording the same block is idempotent.
+    """
+    if not outcomes and not release_effects:
+        return
+    try:
+        if _db_conn is None:
+            init_db()
+        rows, effects = [], []
+        for o in outcomes or []:
+            if not o.get("tx_hash"):
+                continue
+            rows.append((block_hash, o["tx_hash"], int(block_number), int(o["index"]),
+                         o["outcome"], o.get("reason"), int(o.get("fee_charged") or 0),
+                         json.dumps(o.get("rule_effects") or []),
+                         json.dumps(o.get("logs") or [])))
+            for e in o.get("rule_effects") or []:
+                effects.append((e["account"], block_hash, int(block_number), o["tx_hash"], None,
+                                e["kind"], e.get("stream"), e["action"], e["sha256"]))
+        for e in release_effects or []:
+            effects.append((e["account"], block_hash, int(block_number), None,
+                            e.get("request_id"), e["kind"], e.get("stream"),
+                            e["action"], e["sha256"]))
+        with _db_lock:
+            with _db_conn:
+                _db_conn.executemany(
+                    'INSERT OR REPLACE INTO tx_outcomes (block_hash, tx_hash, block_number, '
+                    'tx_index, outcome, reason, fee_charged, effects_json, logs_json) '
+                    'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', rows)
+                _db_conn.execute('DELETE FROM rule_effects WHERE block_hash = ?', (block_hash,))
+                _db_conn.executemany(
+                    'INSERT INTO rule_effects (account, block_hash, block_number, tx_hash, '
+                    'request_id, kind, stream, action, sha256) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                    effects)
+    except Exception:
+        logger.exception("could not record transaction outcomes")
+
+
+def get_tx_outcome(block_hash: str, tx_hash: str) -> Optional[Dict]:
+    """The recorded outcome of `tx_hash` in `block_hash`, or None if not recorded."""
+    if _db_conn is None:
+        init_db()
+    with _db_lock:
+        row = _db_conn.execute(
+            'SELECT tx_index, outcome, reason, fee_charged, effects_json, logs_json '
+            'FROM tx_outcomes WHERE block_hash = ? AND tx_hash = ?',
+            (block_hash, tx_hash)).fetchone()
+    if not row:
+        return None
+    return {"tx_index": int(row[0]), "outcome": row[1], "reason": row[2],
+            "fee_charged": int(row[3]), "rule_effects": json.loads(row[4] or "[]"),
+            "logs": json.loads(row[5] or "[]")}
 
 
 def record_retractable_events(block_hash: str, block_number: int, events) -> None:
