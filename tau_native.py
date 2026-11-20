@@ -1,4 +1,5 @@
 import ctypes
+import hashlib
 import json
 import logging
 import os
@@ -908,6 +909,16 @@ class TauInterface:
         module-level state (`tau` global, live `tau_direct_interface`,
         `_application_rules_state`, etc.) is mutated.
         """
+        error, _interpreter = cls._replay_isolated(consensus_rules_text, revisions)
+        # `_interpreter` falls out of scope here and is reclaimed; no live state touched.
+        return error
+
+    @classmethod
+    def _replay_isolated(cls, consensus_rules_text: str, revisions):
+        """Seed a throwaway interpreter from the first unit, replay the rest and
+        `revisions` through i0. Returns (error, interpreter): error is None on
+        success, interpreter is None when there was nothing to build or the
+        build failed."""
         tau_module = load_tau_module()
         prefix = "Tau staging compile error"
 
@@ -917,19 +928,19 @@ class TauInterface:
         if not units:
             # No baseline to revise against; admission falls back to its
             # cheap structural pass.
-            return None
+            return None, None
 
         seed_spec = cls.preprocess_spec_text(units[0])
         if not seed_spec:
-            return None
+            return None, None
 
         try:
             with StdOutCapture():
                 interpreter, report = _unwrap(tau_module.get_interpreter(seed_spec))
         except RuntimeError as e:
-            return f"{prefix}: {e}"
+            return f"{prefix}: {e}", None
         except Exception as e:
-            return f"Failed to construct staging Tau interpreter: {e}"
+            return f"Failed to construct staging Tau interpreter: {e}", None
 
         if interpreter is None:
             err = report_errors(report)
@@ -937,9 +948,9 @@ class TauInterface:
                 f"Failed to construct staging Tau interpreter from current consensus rules: {err}"
                 if err
                 else "Failed to construct staging Tau interpreter from current consensus rules."
-            )
+            ), None
         if report.has_error:
-            return f"{prefix}: {report_errors(report)}"
+            return f"{prefix}: {report_errors(report)}", None
 
         # Replay the remaining accumulated units (joined via i0 -> u like the
         # live interpreter), then the candidate revisions, through i0.
@@ -968,12 +979,12 @@ class TauInterface:
                             tau_module.get_inputs_for_step(interpreter)
                         )
                 except Exception as e:
-                    return f"{prefix}: {e}"
+                    return f"{prefix}: {e}", None
 
                 if report.has_error:
-                    return f"{prefix}: {report_errors(report)}"
+                    return f"{prefix}: {report_errors(report)}", None
                 if required_inputs is None:
-                    return f"{prefix}: engine returned no input prompt"
+                    return f"{prefix}: engine returned no input prompt", None
 
                 assignments = {}
                 consumed_this_iteration = False
@@ -990,10 +1001,10 @@ class TauInterface:
                     with StdOutCapture():
                         outputs, report = _unwrap(tau_module.step(interpreter, assignments))
                 except Exception as e:
-                    return f"{prefix}: {e}"
+                    return f"{prefix}: {e}", None
 
                 if report.has_error:
-                    return f"{prefix}: {report_errors(report)}"
+                    return f"{prefix}: {report_errors(report)}", None
 
                 if outputs is not None:
                     if consumed_this_iteration:
@@ -1002,7 +1013,7 @@ class TauInterface:
                             None,
                         )
                         if o0 is not None and o0 != "F":
-                            return f"{prefix}: engine did not route revision (o0={o0})"
+                            return f"{prefix}: engine did not route revision (o0={o0})", None
                     break
 
                 if consumed_this_iteration:
@@ -1015,7 +1026,7 @@ class TauInterface:
                         f"{prefix}: engine rejected revision: {detail}"
                         if detail
                         else f"{prefix}: engine rejected revision (no outputs)"
-                    )
+                    ), None
 
         # Drain one more prompt so a type error deferred past the final
         # revision's step still surfaces instead of going unobserved.
@@ -1023,12 +1034,34 @@ class TauInterface:
             with StdOutCapture():
                 _, tail_report = _unwrap(tau_module.get_inputs_for_step(interpreter))
         except Exception as e:
-            return f"{prefix}: {e}"
+            return f"{prefix}: {e}", None
         if tail_report.has_error:
-            return f"{prefix}: {report_errors(tail_report)}"
+            return f"{prefix}: {report_errors(tail_report)}", None
 
-        # `interpreter` falls out of scope here and is reclaimed; no live state touched.
-        return None
+        return None, interpreter
+
+    @classmethod
+    def running_spec_isolated(cls, rules_text: str):
+        """The specification the engine runs after the committed rule history.
+
+        Rebuilds a throwaway interpreter exactly as the node does (first unit as
+        seed, every later unit through i0) and reads the engine's own
+        ``current_spec()``, so a unit that a later pointwise revision displaced
+        is absent. Deterministic for a given rule history, so every node at the
+        same tip, and a replay from block 0, give the same text.
+        """
+        error, interpreter = cls._replay_isolated(rules_text, [])
+        if error is not None:
+            return {"ok": False, "error": error}
+        if interpreter is None:
+            return {"ok": False, "error": "no rule history to replay"}
+        text = cls._ensure_trailing_period(str(interpreter.current_spec() or ""))
+        return {
+            "ok": True,
+            "text": text,
+            "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            "spec_revision": _interpreter_spec_revision(interpreter),
+        }
 
 
 
@@ -1075,6 +1108,67 @@ def admission_compile_timeout() -> float:
     import config
     budget = getattr(config, "ADMISSION_BUDGET", None) or config.COMM_TIMEOUT
     return float(min(budget, config.COMM_TIMEOUT))
+
+
+def running_spec_subprocess(rules_text: str, timeout: float):
+    """`TauInterface.running_spec_isolated` in a throwaway child process.
+
+    Native per-stream widths are process-global, so the live node never builds
+    this interpreter in its own process. Returns the worker's dict
+    ({"text", "sha256", "spec_revision"}); raises NativeTauUnavailable /
+    RuleCompileTimeout like the compile path, and ValueError when the history
+    could not be replayed.
+    """
+    result = _run_isolated_worker(
+        {"consensus_rules_text": rules_text or "", "revisions": [],
+         "mode": "running_spec"},
+        timeout,
+    )
+    if result.get("ok") and result.get("running_spec"):
+        spec = dict(result["running_spec"])
+        spec.pop("ok", None)
+        return spec
+    raise ValueError(result.get("error") or "running spec unavailable")
+
+
+def _run_isolated_worker(request_obj, timeout: float):
+    """Spawn the compile worker with `request_obj`; return its result dict.
+
+    Raises RuleCompileTimeout / NativeTauUnavailable as the compile path does.
+    A worker that dies without reporting returns {"ok": False, "error": ...}.
+    """
+    repo_root = os.path.dirname(os.path.abspath(__file__))
+    try:
+        load_tau_module()
+    except Exception:
+        pass
+    child_env = dict(os.environ)
+    extra_paths = [p for p in (native_tau_dir(), repo_root) if p]
+    existing_pp = child_env.get("PYTHONPATH", "")
+    child_env["PYTHONPATH"] = os.pathsep.join(
+        extra_paths + ([existing_pp] if existing_pp else [])
+    )
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-m", _COMPILE_WORKER_MODULE],
+            input=json.dumps(request_obj), capture_output=True, text=True,
+            cwd=repo_root, timeout=timeout, env=child_env,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuleCompileTimeout(f"Isolated Tau worker timed out after {timeout:.0f}s.") from exc
+    except Exception as exc:
+        raise NativeTauUnavailable(str(exc)) from exc
+    for line in (proc.stdout or "").splitlines():
+        if line.startswith(_COMPILE_RESULT_SENTINEL):
+            try:
+                result = json.loads(line[len(_COMPILE_RESULT_SENTINEL):])
+            except Exception as exc:
+                return {"ok": False, "error": f"unparseable worker result: {exc}"}
+            if result.get("unavailable"):
+                raise NativeTauUnavailable(result.get("error") or "native tau unavailable")
+            return result
+    tail = (proc.stderr or proc.stdout or "").strip()[-500:]
+    return {"ok": False, "error": f"worker produced no result (exit={proc.returncode}). {tail}"}
 
 
 def compile_revisions_isolated_subprocess(

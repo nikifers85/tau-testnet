@@ -7,7 +7,8 @@ the parent (see `tau_native.compile_revisions_isolated_subprocess`). Nothing
 here touches the parent server's live interpreter state.
 
 Protocol:
-  stdin  : JSON {"consensus_rules_text": str, "revisions": [str, ...]}
+  stdin  : JSON {"consensus_rules_text": str, "revisions": [str, ...],
+                 "mode": "compile" | "running_spec"}  (mode defaults to compile)
   stdout : a single line `__TAU_COMPILE_RESULT__<json>` where <json> is
            {"ok": bool, "error": str|null}. Native compile chatter may precede
            it on stdout; the parent scans for the sentinel prefix.
@@ -24,6 +25,7 @@ def main() -> int:
         payload = json.load(sys.stdin)
         consensus_rules_text = payload.get("consensus_rules_text", "") or ""
         revisions = payload.get("revisions", []) or []
+        mode = payload.get("mode", "compile")
     except Exception as exc:  # malformed request from parent
         sys.stdout.write(
             RESULT_SENTINEL
@@ -40,10 +42,16 @@ def main() -> int:
         # the live validation path instead of rejecting the transaction.
         tau_native.load_tau_module()
 
-        err = tau_native.TauInterface.compile_revisions_isolated(
-            consensus_rules_text, revisions
-        )
-        result = {"ok": err is None, "error": err}
+        if mode == "running_spec":
+            # The spec the engine runs after this rule history (bounty 02, #42).
+            spec = tau_native.TauInterface.running_spec_isolated(consensus_rules_text)
+            result = {"ok": bool(spec.get("ok")), "error": spec.get("error"),
+                      "running_spec": spec if spec.get("ok") else None}
+        else:
+            err = tau_native.TauInterface.compile_revisions_isolated(
+                consensus_rules_text, revisions
+            )
+            result = {"ok": err is None, "error": err}
     except ImportError as exc:
         result = {"ok": False, "unavailable": True, "error": f"native tau unavailable: {exc}"}
     except Exception as exc:

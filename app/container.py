@@ -23,6 +23,7 @@ from commands import (
     getapprovalslots,
     getrequestid,
     getchainid,
+    getrunningspec,
     getgrants,
     getpayoutrules,
     getreceiveroute,
@@ -93,6 +94,8 @@ class ServiceContainer:
         "getretractableid": getretractableid,
         # Conditional grants (programmable payments).
         "getchainid": getchainid,
+        # What the engine runs (bounty 02, #42).
+        "getrunningspec": getrunningspec,
         "getgrants": getgrants,
         "getpayoutrules": getpayoutrules,
         "getreceiveroute": getreceiveroute,

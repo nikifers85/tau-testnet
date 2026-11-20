@@ -368,6 +368,34 @@ def _rule_effect(account, stream, before, after, kind="clause") -> Optional[Dict
     }
 
 
+def _application_unit_effect(account, rule_text, engine_receipt) -> Dict[str, Any]:
+    """The effect of a rule unit the engine took into the shared spec (#42).
+
+    `revision` says whether the engine took the revision branch, from its own
+    verdict: "taken" when the specification changed, "noop" when it accepted a
+    unit that changed nothing, "unknown" when the binding gives no counter.
+    `spec_revision` is the engine's counter after the unit (before/after kept so
+    a wallet can see the step). The text in force is served by getrunningspec.
+    """
+    rec = engine_receipt or {}
+    outcome = rec.get("outcome")
+    if outcome == "ACCEPTED_CHANGED":
+        revision = "taken"
+    elif outcome == "ACCEPTED_NOOP":
+        revision = "noop"
+    else:
+        revision = "unknown"
+    return {
+        "account": account, "kind": "application_unit", "stream": None,
+        "action": "accumulated",
+        "sha256": hashlib.sha256(str(rule_text).encode("utf-8")).hexdigest(),
+        "revision": revision,
+        "engine_outcome": outcome,
+        "spec_revision": rec.get("spec_revision_after"),
+        "spec_revision_before": rec.get("spec_revision_before"),
+    }
+
+
 def _release_rule_changes(lm, height, timestamp, timeout, effects=None) -> List[Tuple[str, str]]:
     """Write every READY rule-change request, lowest id first, up to the per-block cap.
 
@@ -3269,6 +3297,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                     current_tau_bytes = "\n".join(units).encode("utf-8")
                                     _rule_touched_canonical = True
                                     tx_receipt["logs"].append("Rule applied (staged)")
+                                    tx_receipt.setdefault("rule_effects", []).append(
+                                        _application_unit_effect(sender, rule_op_data, receipt))
                                 elif not _application_rule_landed(rule_text):
                                     # Live apply: the handler did not persist, so
                                     # this is a no-op that must not sit in the
@@ -3302,12 +3332,8 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
                                         current_tau_bytes += rule_op_data.encode("utf-8")
                                     _rule_touched_canonical = True
                                     tx_receipt["logs"].append("Rule applied")
-                                    tx_receipt.setdefault("rule_effects", []).append({
-                                        "account": sender, "kind": "application_unit",
-                                        "stream": None, "action": "accumulated",
-                                        "sha256": hashlib.sha256(
-                                            str(rule_op_data).encode("utf-8")).hexdigest(),
-                                    })
+                                    tx_receipt.setdefault("rule_effects", []).append(
+                                        _application_unit_effect(sender, rule_op_data, receipt))
 
                           except tau_shrink.ShrinkTypeConflict as e:
                             # W3: node-local. This process cannot represent the
