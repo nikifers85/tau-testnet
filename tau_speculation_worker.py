@@ -247,6 +247,9 @@ class _Session:
             "ok": outcome in (ACCEPTED_CHANGED, ACCEPTED_NOOP),
             "outcome": outcome,
             "candidate_id": candidate_id,
+            # The engine's counter before this candidate; `spec_revision` (from
+            # observe()) is the counter after it.
+            "spec_revision_before": before,
             "consumed": delivered and named is not None and named.get("o0") == "F",
             "asked": asked,
             "outputs": named,

@@ -834,6 +834,23 @@ def _create_block_locked(allow_empty: bool = False, wake_if_due: bool = False) -
         candidate_block.transactions = final_txs
         # Update IDs
         candidate_block.tx_ids = [block.compute_tx_hash(tx) for tx in final_txs]
+        # Outcome records (bounty 02, #42) were computed over the executed set,
+        # whose dicts carry a tx_id: re-key them to the transactions this block
+        # keeps, under the ids gettxstatus is asked about, at their position.
+        try:
+            _meta = apply_result.next_snapshot.metadata
+            _executed = list(_meta.get("tx_outcomes") or [])
+            if len(_executed) == len(execution_transactions):
+                _kept, _pos = [], 0
+                for _i, _tx in enumerate(execution_transactions):
+                    _tid = _tx.get('tx_id')
+                    if _tid in apply_result.accepted_tx_ids or _tid in apply_result.skipped_tx_ids:
+                        _kept.append(dict(_executed[_i], index=_pos,
+                                          tx_hash=candidate_block.tx_ids[_pos]))
+                        _pos += 1
+                _meta["tx_outcomes"] = _kept
+        except Exception as _exc:  # node-local history; never fatal
+            logger.warning("could not re-key transaction outcomes: %s", _exc)
         candidate_block.header.merkle_root = block.compute_merkle_root(candidate_block.tx_ids)
         candidate_block.header.state_hash = apply_result.next_snapshot.state_hash
         candidate_block.header.state_locator = f"{config.STATE_LOCATOR_NAMESPACE}:{apply_result.next_snapshot.state_hash}"

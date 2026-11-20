@@ -580,8 +580,18 @@ def _record_tx_outcomes(block, next_snapshot) -> None:
     """Best-effort node-local record of what each transaction did (bounty 02)."""
     try:
         meta = getattr(next_snapshot, "metadata", None) or {}
+        # A proposer reuses the evaluation of its candidate block, which may
+        # have held transactions it then dropped: keep the outcomes of the
+        # transactions this block contains, at their position in it.
+        ids = list(getattr(block, "tx_ids", None) or [])
+        recorded = []
+        for o in meta.get("tx_outcomes") or []:
+            if ids and o.get("tx_hash") in ids:
+                recorded.append(dict(o, index=ids.index(o["tx_hash"])))
+            elif not ids:
+                recorded.append(o)
         db.record_tx_outcomes(block.block_hash, block.header.block_number,
-                              meta.get("tx_outcomes") or [], meta.get("release_effects") or [])
+                              recorded, meta.get("release_effects") or [])
     except Exception:
         logger.exception("could not record transaction outcomes")
 

@@ -105,3 +105,25 @@ def test_an_application_unit_effect_carries_the_engine_verdict(outcome, revision
         assert (eff["spec_revision_before"], eff["spec_revision"]) == (1, 2)
     else:
         assert eff["spec_revision"] is None
+
+
+def test_a_speculative_worker_receipt_names_the_counter_spec_revision():
+    eff = _application_unit_effect("aa" * 48, "always (o26 = 3).", {
+        "outcome": "ACCEPTED_CHANGED", "spec_revision": 6, "spec_revision_before": 5})
+    assert eff["revision"] == "taken" and (eff["spec_revision_before"], eff["spec_revision"]) == (5, 6)
+
+
+def test_outcomes_are_recorded_under_the_block_ids_and_positions(monkeypatch):
+    """A proposer reuses its candidate's evaluation: a dropped transaction's
+    outcome is not recorded and the others take their position in the block."""
+    import chain_state
+    seen = {}
+    monkeypatch.setattr(chain_state.db, "record_tx_outcomes",
+                        lambda bh, n, outs, rel: seen.update(outs=outs))
+    block = types.SimpleNamespace(block_hash="bb" * 32, tx_ids=["t2"],
+                                  header=types.SimpleNamespace(block_number=3))
+    snap = types.SimpleNamespace(metadata={"tx_outcomes": [
+        {"index": 0, "tx_hash": "t1", "outcome": "rejected"},
+        {"index": 1, "tx_hash": "t2", "outcome": "applied"}]})
+    chain_state._record_tx_outcomes(block, snap)
+    assert seen["outs"] == [{"index": 0, "tx_hash": "t2", "outcome": "applied"}]

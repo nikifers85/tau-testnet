@@ -74,6 +74,7 @@ py-modules = [
     "db",
     "errors",
     "rate_limit",
+    "rules_view",
     "server",
     "tau_admission",
     "tau_advisory",

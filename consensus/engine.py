@@ -391,7 +391,9 @@ def _application_unit_effect(account, rule_text, engine_receipt) -> Dict[str, An
         "sha256": hashlib.sha256(str(rule_text).encode("utf-8")).hexdigest(),
         "revision": revision,
         "engine_outcome": outcome,
-        "spec_revision": rec.get("spec_revision_after"),
+        # The in-process receipt names the counter `spec_revision_after`; a
+        # speculative worker's receipt carries it as `spec_revision`.
+        "spec_revision": rec.get("spec_revision_after", rec.get("spec_revision")),
         "spec_revision_before": rec.get("spec_revision_before"),
     }
 
@@ -976,6 +978,12 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         from chain_state import compute_accounts_hash
         import chain_state
 
+        # Transaction hashes as submitted, taken before apply touches the
+        # dicts: they are the ids gettxstatus is asked about (bounty 02, #42).
+        from block import compute_tx_hash as _tx_hash
+        _submitted_ids = [_tx_hash(tx) if isinstance(tx, dict) else None
+                          for tx in (getattr(block, "transactions", None) or [])]
+
         # 1. State Extraction
         metadata = parent_snapshot.metadata
         t_bals = copy.deepcopy(metadata.get('balances', {}))
@@ -1135,12 +1143,19 @@ class TauConsensusEngine(TauEngine, ConsensusEngine):
         from block import compute_tx_hash
         by_id = {o.tx_id: o.status for o in outcomes}
         tx_outcomes = []
+        # The block's own ids: hashed when the block was built, before apply
+        # touched the transaction dicts, so they are what gettxstatus looks up.
+        block_ids = list(getattr(block, "tx_ids", None) or [])
+        if len(block_ids) != len(block.transactions):
+            block_ids = list(_submitted_ids)
+        if len(block_ids) != len(block.transactions):
+            block_ids = [None] * len(block.transactions)
         for i, tx in enumerate(block.transactions):
             receipt = exec_result.receipts.get(_receipt_lookup_key(tx, i)) or {}
             status = by_id.get(_receipt_lookup_key(tx, i))
             tx_outcomes.append({
                 "index": i,
-                "tx_hash": compute_tx_hash(tx) if isinstance(tx, dict) else None,
+                "tx_hash": block_ids[i] or (compute_tx_hash(tx) if isinstance(tx, dict) else None),
                 "outcome": {"applied": "applied", "skipped/no-op": "skipped",
                             "invalid": "rejected"}.get(status, "not_recorded"),
                 "reason": receipt.get("reason"),

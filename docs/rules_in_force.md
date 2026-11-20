@@ -45,7 +45,7 @@ unit, so a wallet does not have to re-run the engine:
 |---|---|
 | `revision` | `taken` — the engine took the revision and its specification changed; `noop` — accepted, nothing changed; `unknown` — the engine binding gives no counter |
 | `engine_outcome` | the engine's verdict (`ACCEPTED_CHANGED`, `ACCEPTED_NOOP`) |
-| `spec_revision` | the engine's revision counter after the unit (`spec_revision_before`: before it) |
+| `spec_revision` | the counter of the engine that applied the unit on this node, after it (`spec_revision_before`: before it). The step (+1) is what a wallet checks; the absolute value is per engine process and can differ between nodes |
 
 A unit the engine rejects never reaches a block (`reason: rule_rejected`).
 
@@ -70,6 +70,11 @@ never touched). It is a pure function of the history, cached by its hash, so
 every node at the same tip and a replay from block 0 give the same text and
 `sha256`. `status: unavailable` (with a `reason`) means this node could not run
 the engine; it never falls back to the stored text.
+
+On live nodes: `scripts/e2e_rules_in_force.py` sends the two units as real rule
+transactions and checks the outcomes in `gettxstatus` on the proposer and on a
+follower, the running spec on the proposer, after its restart, and on a
+follower that replayed every block from genesis (same block, text and sha256).
 
 Tests: `tests/test_running_spec_native.py` (the probe above on the real engine;
 a second process and a block-by-block replay give the same text and hash; the
