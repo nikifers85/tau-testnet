@@ -127,3 +127,4 @@ $RECYCLE.BIN/
 *.msm
 *.msp
 *.lnk
+!docs/design/programmable_payments_one_rule.md
